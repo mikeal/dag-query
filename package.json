@@ -1,0 +1,24 @@
+{
+  "name": "dag-query",
+  "version": "0.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "Mikeal Rogers <mikeal.rogers@gmail.com> (https://www.mikealrogers.com/)",
+  "license": "(Apache-2.0 AND MIT)",
+  "dependencies": {
+    "@ipld/dag-cbor": "^2.0.3",
+    "it-pipe": "^1.1.0",
+    "libp2p": "^0.30.0",
+    "libp2p-mplex": "^0.10.1",
+    "libp2p-noise": "^2.0.1",
+    "libp2p-websockets": "^0.15.0"
+  },
+  "devDependencies": {
+    "mocha": "^8.2.1"
+  }
+}
