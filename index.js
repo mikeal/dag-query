@@ -1,56 +1,34 @@
-import Libp2p from 'libp2p'
-import WebSockets from 'libp2p-websockets'
-import libp2pNoise from 'libp2p-noise'
-import MPLEX from 'libp2p-mplex'
-import itpipe from 'it-pipe'
+import net from 'net'
+import bl from 'bl'
 import * as codec from '@ipld/dag-cbor'
 import { sha256 as hasher } from 'multiformats/hashes/sha2'
 import { decode as decodeBlock, encode as encodeBlock } from 'multiformats/block'
 
-const { NOISE } = libp2pNoise
-const { pipe } = itpipe
-
-const modules = {
-  transport: [WebSockets],
-  connEncryption: [NOISE],
-  streamMuxer: [MPLEX]
+const enc32 = value => {
+  value = +value
+  const buff = new Uint8Array(4)
+  buff[3] = (value >>> 24)
+  buff[2] = (value >>> 16)
+  buff[1] = (value >>> 8)
+  buff[0] = (value & 0xff)
+  return buff
 }
 
-class BlockSwap {
-  constructor (store) {
-    this.store = store
-  }
-  async * query (request) {
-    let { get } = request
-    yield { block: await this.store.get(get) }
-  }
-  static async * encodeRequest (request) {
-    yield codec.encode(request)
-  }
+let TOKENS = {
+  REQUEST: 0,
+  BLOCK: 1,
+  END: 2
 }
+const RTOKENS = new Map(Object.entries([k, v] => [v, k]))
+TOKENS = Object.fromEntries(Object.entries([k, v] => [k, enc8(v)]))
 
-const queryClasses = {
-  'blockswap': BlockSwap
-}
-
-const decode = chunk => decodeBlock({ hasher, codec, bytes: chunk.subarray() })
-const encode = value => encodeBlock({ hasher, codec, value })
-
-const msg = {
+const handlers = {
   end: {
-    encode: async function * () {
-      yield new Uint8Array([ 1 ])
-    }
+    encode: (id) => bl([ TOKENS.END, enc32(id) ])
   },
   block: {
-    encode: async function * (value) {
-      console.log('encode')
-      const { cid, bytes } = await encode(value)
-      yield new Uint8Array([ 0 ])
-      yield new Uint8Array([ cid.bytes.byteLength ])
-      yield cid.bytes
-      yield bytes
-      console.log('written')
+    encode: ({ cid, bytes }) => {
+      return [ TOKENS.BLOCK, enc8(cid.bytes.byteLength), cid.bytes, bytes ]
     },
     decode: async chunk => {
       const length = chunk.get(0)
@@ -65,147 +43,49 @@ const msg = {
     }
   }
 }
-
-const encodeMessage = ({ block, end }) => {
-  if (block) return msg.block.encode(block)
-  if (end) return msg.end.encode()
-  throw new Error('Unknown message type')
-}
-const decodeMessage = chunk => {
-  chunk = chunk instanceof Uint8Array ? chunk : chunk.slice()
-  const [ type ] = chunk
-  if (type === 0) return msg.block.decode(chunk.subarray(1))
-  if (type === 1) return { end: true }
-  throw new Error('Unknown message type')
-}
-
-class Protocol {
-  constructor ({ stream, queries }) {
-    this.stream = stream
-    if (!queries) throw new Error('forgot queries')
-    this.queries = queries
-    if (stream) this.runner = this.onStream(stream)
-    else this.service = true
-  }
-  async * query (request) {
-    // TODO: we can hang other to player properties off this
-    // structure for cids to ignore and other cache features
-    // that can be implemented on top of the query side
-    const { blockswap } = request
-    if (blockswap) {
-      yield * this.queries.blockswap.query(blockswap)
-      return
-    }
-    throw new Error('Unknown query type')
-  }
-  async onStream (stream) {
-    for await (const chunk of stream.source) {
-      if (this.service) {
-        const value = codec.decode(chunk.slice())
-        for await (const msg of this.query(value)) {
-          pipe(encodeMessage(msg), stream)
-        }
-        pipe(encodeMessage({ end: true }), stream)
-      } else {
-        const resp = await decodeMessage(chunk)
-        console.log(1, {resp})
-      }
-    }
-    if (this._onStreamResolve) {
-      this._onStreamResolve()
-    }
-  }
-  static handler (node, queries) {
-    const protocol = new Protocol({ queries })
-    node.handle(`/dag-query/0.0.0`, ( { stream } ) => {
-      protocol.stream = stream
-      protocol.onStream(stream)
-    })
-    return protocol
-  }
-  request (name, request) {
-    const CLS = queryClasses[name]
-    if (!CLS) throw new Error(`No query class named "${name}"`)
-    return new Promise(async (resolve, reject) => {
-      const iter = CLS.encodeRequest(request)
-      if (!this.stream) {
-        throw new Error('No stream attached to protocol.')
-      }
-      pipe(iter, this.stream, async source => {
-        try {
-          for await (const data of source) {
-            console.log({data})
-          }
-        } catch (e) {
-          return reject(e)
-        }
-        resolve('done')
-      })
-    })
+const wrap = (handler) => {
+  return (conn, ...args) => {
+    const b = handlers(...args)
+    conn.write(enc32(b.length))
+    conn.write(b.slice())
   }
 }
-Protocol.version = '0.0.0'
-
-const protocols = {}
-const addProtocol = (CLS) => {
-  protocols[CLS.version] = CLS
+const msg = {
+  end: wrap(handlers.end),
+  block: wrap(handlers.block)
 }
-addProtocol(Protocol)
 
-const protocolVersions = () => Object.keys(protocols).map(p => `/dag-query/${p}`)
-
-const { fromEntries, entries } = Object
-
-class Node {
-  constructor ({ conf, store }) {
-    this.conf = conf
-    this.queries = fromEntries(entries(queryClasses).map(([k, Cls]) => [ k, new Cls(store) ]))
-    this.connections = {}
+const create = ({ onAsk, onBlock }) => {
+  const parser = () => {}
+  const parseAddress => str => {
+    if (str.startsWith('tcp://')) str = str.slice('tcp://'.length)
+    return str.split(':').filter(x => x).reverse()
   }
-  async serve () {
-    if (this.node) throw new Error('Cannot serve after node is instantiated')
-
-    // TODO: pull protocols and ports from conf
-    this.node = await Libp2p.create({
-      addresses: {
-        listen: ['/ip4/127.0.0.1/tcp/8000/ws']
-      },
-      modules
-    })
-
-    const protocol = Protocol.handler(this.node, this.queries)
-    // start libp2p
-    await this.node.start()
-    return this.node.multiaddrs.map(addr => `${addr.toString()}/p2p/${this.node.peerId.toB58String()}`)
-  }
-  async connect (addr) {
-    if (!this.node) {
-      this.node = await Libp2p.create({ modules })
-    }
+  const connections = {}
+  const server = net.createServer(socket => {
+    parser(socket)
+  })
+  const reqid = 0
+  const reqs = new Map()
+  const request = (addr, req) => {
     let conn
-    if (!this.connections[addr]) {
-      conn = await this.node.dial(addr)
-      // conn.on('end', () => console.log('end', addr))
-      // conn.on('close', () => console.log('close', addr))
-      this.connections[addr] = conn
-    } else {
-      conn = this.connections[addr]
+    if (connections[addr]) conn = connections[addr].deref()
+    if (!conn) {
+      conn = net.connect(...parseAddress(addr))
+      parser(conn)
     }
-    const { stream, protocol } = await conn.newStream(protocolVersions())
-    const [,, name] = protocol.split('/')
-    const Cls = protocols[name]
-    return new Cls({ stream, queries: this.queries })
+    connections[addr] = new WeakRef(conn)
+    const id = reqid++
+    reqs.set(id, new Promise(resolve => {
+      reqs.get(id).resolve = resolve
+    }))
+    msg.request(conn, req)
+    return reqs.get(id)
   }
-  async * request (addr, name, request) {
-    const protocol = await this.connect(addr)
-    yield * protocol.request(name, request)
+  const close = async () => {
+    // TODO: check if open
+    await server.close()
+    // TODO: iterate over open connections
   }
-  stop () {
-    return this.node.stop()
-  }
-  static create ({ store }) {
-    return new Node({ store })
-  }
+  return { server, request, close }
 }
-
-export default Node
